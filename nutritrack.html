@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no"/>
+<meta name="theme-color" content="#0f1117"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="NutriTrack"/>
+<meta name="description" content="Suivi nutritionnel intelligent avec IA"/>
+<title>NutriTrack</title>
+
+<!-- Manifest inline via JS (no separate file needed) -->
+<script>
+const MANIFEST = {
+  name: "NutriTrack — Suivi Nutritionnel",
+  short_name: "NutriTrack",
+  description: "Suivi des repas, collations, pas et hydratation",
+  start_url: "./",
+  display: "standalone",
+  background_color: "#0f1117",
+  theme_color: "#4ade80",
+  orientation: "portrait",
+  icons: [
+    { src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='40' fill='%230f1117'/%3E%3Ctext x='96' y='130' text-anchor='middle' font-size='110'%3E🥗%3C/text%3E%3C/svg%3E", sizes: "192x192", type: "image/svg+xml" },
+    { src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='100' fill='%230f1117'/%3E%3Ctext x='256' y='350' text-anchor='middle' font-size='300'%3E🥗%3C/text%3E%3C/svg%3E", sizes: "512x512", type: "image/svg+xml" }
+  ]
+};
+const blob = new Blob([JSON.stringify(MANIFEST)], {type:'application/json'});
+const link = document.createElement('link');
+link.rel = 'manifest'; link.href = URL.createObjectURL(blob);
+document.head.appendChild(link);
+</script>
+
+<!-- Service Worker registration -->
+<script>
+if ('serviceWorker' in navigator) {
+  const SW = `
+const CACHE = 'nutritrack-v1';
+self.addEventListener('install', e => { self.skipWaiting(); });
+self.addEventListener('activate', e => { e.waitUntil(clients.claim()); });
+self.addEventListener('fetch', e => {
+  if (e.request.url.includes('anthropic.com')) return;
+  e.respondWith(
+    caches.open(CACHE).then(cache =>
+      cache.match(e.request).then(r => r || fetch(e.request).then(res => {
+        cache.put(e.request, res.clone()); return res;
+      }).catch(() => cache.match('/') ))
+    )
+  );
+});`;
+  const swBlob = new Blob([SW], {type:'text/javascript'});
+  navigator.serviceWorker.register(URL.createObjectURL(swBlob))
+    .catch(()=>{});
+}
+</script>
+
+<!-- React + Babel -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+  html,body,#root{height:100%;overscroll-behavior:none;}
+  body{background:#0f1117;color:#e2e8f0;font-family:'Segoe UI',system-ui,sans-serif;
+       -webkit-font-smoothing:antialiased;overflow-x:hidden;}
+  input,textarea,button{font-family:inherit;}
+  ::-webkit-scrollbar{width:4px;height:4px;}
+  ::-webkit-scrollbar-track{background:#0f1117;}
+  ::-webkit-scrollbar-thumb{background:#2a3050;border-radius:99px;}
+  textarea{resize:vertical;}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  .fade-in{animation:fadeIn .25s ease forwards;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .spin{animation:spin 1s linear infinite;display:inline-block;}
+
+  /* Safe area padding for notched phones */
+  .safe-top{padding-top:env(safe-area-inset-top,0px);}
+  .safe-bottom{padding-bottom:calc(env(safe-area-inset-bottom,0px) + 80px);}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const {useState, useEffect, useCallback, useRef} = React;
+
+// ── Design tokens ──────────────────────────────────────────────────────────
+const C = {
+  bg:"#0f1117", surface:"#181c27", card:"#1e2333", border:"#2a3050",
+  accent:"#4ade80", accentDim:"#22c55e22",
+  warn:"#fb923c", warnDim:"#fb923c22",
+  blue:"#60a5fa", blueDim:"#3b82f622",
+  purple:"#a78bfa", purpleDim:"#7c3aed22",
+  red:"#f87171",
+  muted:"#64748b", text:"#e2e8f0", textDim:"#94a3b8",
+};
+
+const GOALS = {calories:2000, proteines:150, glucides:250, lipides:65};
+
+const FIXED_MEALS = [
+  {id:"breakfast", label:"Petit-déjeuner", icon:"🌅", time:"07:30"},
+  {id:"lunch",     label:"Déjeuner",       icon:"☀️",  time:"12:30"},
+  {id:"dinner",    label:"Dîner",           icon:"🌙", time:"19:00"},
+];
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+const todayKey = () => new Date().toISOString().slice(0,10);
+const uid      = () => Math.random().toString(36).slice(2,9);
+const clamp    = (v,lo,hi) => Math.min(hi,Math.max(lo,v));
+const fmtDate  = (d) => new Date(d+"T12:00:00").toLocaleDateString("fr-FR",{weekday:"short",day:"numeric",month:"short"});
+const fmtDateFull = (d) => new Date(d+"T12:00:00").toLocaleDateString("fr-FR",{weekday:"long",day:"numeric",month:"long"});
+
+const defaultDay = () => ({
+  meals:{breakfast:[],lunch:[],dinner:[]},
+  snacks:[], steps:null, water:0, notes:"",
+});
+
+// ── Persistence ────────────────────────────────────────────────────────────
+function usePersist(key, init){
+  const [s, setS] = useState(()=>{
+    try{return JSON.parse(localStorage.getItem(key))??init();}
+    catch{return init();}
+  });
+  useEffect(()=>{try{localStorage.setItem(key,JSON.stringify(s));}catch{}},[key,s]);
+  return [s, setS];
+}
+
+// ── AI nutrition estimation ────────────────────────────────────────────────
+async function estimateNutrition(desc){
+  try{
+    const r = await fetch("https://api.anthropic.com/v1/messages",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        model:"claude-sonnet-4-20250514", max_tokens:200,
+        system:`Expert nutrition. Réponds UNIQUEMENT en JSON valide sans markdown.
+Format: {"calories":number,"proteines":number,"glucides":number,"lipides":number,"fibres":number}`,
+        messages:[{role:"user",content:`Valeur nutritionnelle de: "${desc}"`}]
+      })
+    });
+    const d = await r.json();
+    return JSON.parse((d.content?.[0]?.text||"{}").replace(/```json?|```/g,"").trim());
+  }catch{return {calories:0,proteines:0,glucides:0,lipides:0,fibres:0};}
+}
+
+// ── Micro components ───────────────────────────────────────────────────────
+function CalRing({consumed, goal}){
+  const pct = clamp(consumed/goal,0,1);
+  const r=40, cx=50, cy=50, circ=2*Math.PI*r;
+  const over = consumed > goal;
+  return (
+    <svg viewBox="0 0 100 100" width={100} height={100}>
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke={C.border} strokeWidth={9}/>
+      <circle cx={cx} cy={cy} r={r} fill="none"
+        stroke={over?C.warn:C.accent} strokeWidth={9}
+        strokeDasharray={`${pct*circ} ${circ}`}
+        strokeLinecap="round" transform="rotate(-90 50 50)"
+        style={{transition:"stroke-dasharray .5s ease"}}/>
+      <text x={cx} y={cy-5} textAnchor="middle" fill={C.text} fontSize={15} fontWeight={700}>{consumed}</text>
+      <text x={cx} y={cy+10} textAnchor="middle" fill={C.muted} fontSize={9}>/ {goal} kcal</text>
+    </svg>
+  );
+}
+
+function MacroBar({label, value, max, color}){
+  const pct = clamp(value/max*100,0,100);
+  return(
+    <div style={{marginBottom:10}}>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:C.textDim,marginBottom:3}}>
+        <span>{label}</span><span style={{color:value>max?C.warn:C.textDim}}>{value}g / {max}g</span>
+      </div>
+      <div style={{height:5,background:C.border,borderRadius:99,overflow:"hidden"}}>
+        <div style={{width:`${pct}%`,height:"100%",background:color,borderRadius:99,transition:"width .4s ease"}}/>
+      </div>
+    </div>
+  );
+}
+
+function Pill({children, color=C.accent, onClick, active}){
+  return(
+    <button onClick={onClick} style={{
+      padding:"5px 12px", borderRadius:20, border:`1px solid ${active?color:C.border}`,
+      background:active?color+"22":"none", color:active?color:C.textDim,
+      fontSize:12, fontWeight:600, cursor:"pointer", whiteSpace:"nowrap"
+    }}>{children}</button>
+  );
+}
+
+function Toast({msg, onDone}){
+  useEffect(()=>{const t=setTimeout(onDone,2500);return()=>clearTimeout(t);},[onDone]);
+  return(
+    <div style={{position:"fixed",bottom:90,left:"50%",transform:"translateX(-50%)",
+      background:C.accent,color:"#0f1117",padding:"10px 20px",borderRadius:12,
+      fontWeight:700,fontSize:14,zIndex:999,boxShadow:"0 4px 20px #0008",
+      animation:"fadeIn .2s ease"}}>
+      {msg}
+    </div>
+  );
+}
+
+// ── Food item row ──────────────────────────────────────────────────────────
+function FoodItem({item, onDelete}){
+  return(
+    <div className="fade-in" style={{display:"flex",alignItems:"center",gap:8,
+      padding:"8px 10px",background:C.bg,borderRadius:10,marginBottom:5}}>
+      <div style={{flex:1}}>
+        <div style={{fontSize:13,color:C.text,fontWeight:500}}>{item.name}</div>
+        {item.loading
+          ? <div style={{fontSize:11,color:C.muted}}>⏳ Estimation IA…</div>
+          : <div style={{fontSize:11,color:C.muted}}>
+              {item.calories} kcal &nbsp;·&nbsp; P {item.proteines}g &nbsp;·&nbsp; G {item.glucides}g &nbsp;·&nbsp; L {item.lipides}g
+            </div>}
+      </div>
+      <button onClick={onDelete} style={{
+        background:"none",border:"none",color:C.muted,cursor:"pointer",
+        fontSize:20,lineHeight:1,padding:"0 4px",
+      }}>×</button>
+    </div>
+  );
+}
+
+// ── Add food form ──────────────────────────────────────────────────────────
+function AddFoodForm({onAdd}){
+  const [val,setVal] = useState("");
+  const [busy,setBusy] = useState(false);
+  const ref = useRef();
+
+  const submit = async()=>{
+    const name = val.trim(); if(!name||busy) return;
+    setBusy(true); setVal("");
+    const tempId = uid();
+    onAdd({id:tempId,name,calories:0,proteines:0,glucides:0,lipides:0,fibres:0,loading:true});
+    const nutr = await estimateNutrition(name);
+    onAdd({id:tempId,name,...nutr,loading:false,_replace:tempId});
+    setBusy(false);
+    ref.current?.focus();
+  };
+
+  return(
+    <div style={{display:"flex",gap:6,marginTop:10}}>
+      <input ref={ref} value={val} onChange={e=>setVal(e.target.value)}
+        onKeyDown={e=>e.key==="Enter"&&submit()}
+        placeholder="Ex : yaourt grec 150g, pomme…"
+        style={{flex:1,background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,
+          color:C.text,fontSize:13,padding:"9px 12px",outline:"none"}}/>
+      <button onClick={submit} disabled={busy||!val.trim()} style={{
+        background:busy?C.border:C.accent,color:busy?"#64748b":"#0f1117",border:"none",
+        borderRadius:10,padding:"9px 16px",fontWeight:800,cursor:"pointer",fontSize:16,
+        opacity:!val.trim()?0.4:1,transition:"all .15s"
+      }}>{busy?<span className="spin">⟳</span>:"+"}</button>
+    </div>
+  );
+}
+
+// ── Meal card ──────────────────────────────────────────────────────────────
+function MealCard({meal, items, onAdd, onDelete, defaultOpen=false}){
+  const [open,setOpen] = useState(defaultOpen);
+  const total = items.reduce((s,i)=>s+(i.calories||0),0);
+  return(
+    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,
+      marginBottom:10,overflow:"hidden"}}>
+      <div onClick={()=>setOpen(o=>!o)} style={{display:"flex",alignItems:"center",
+        gap:10,padding:"14px 16px",cursor:"pointer",userSelect:"none"}}>
+        <div style={{width:40,height:40,borderRadius:12,background:C.accentDim,
+          display:"flex",alignItems:"center",justifyContent:"center",fontSize:20}}>
+          {meal.icon}
+        </div>
+        <div style={{flex:1}}>
+          <div style={{fontSize:14,fontWeight:700,color:C.text}}>{meal.label}</div>
+          <div style={{fontSize:11,color:C.muted}}>{meal.time} · {items.length} aliment{items.length!==1?"s":""} · <span style={{color:total>0?C.accent:C.muted}}>{total} kcal</span></div>
+        </div>
+        <div style={{fontSize:20,color:C.muted,transform:open?"rotate(180deg)":"none",transition:"transform .2s"}}>⌄</div>
+      </div>
+      {open&&(
+        <div className="fade-in" style={{padding:"0 16px 16px"}}>
+          {items.map(item=><FoodItem key={item.id} item={item} onDelete={()=>onDelete(item.id)}/>)}
+          <AddFoodForm onAdd={onAdd}/>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Snack card ─────────────────────────────────────────────────────────────
+function SnackCard({items, onAdd, onDelete}){
+  const [open,setOpen] = useState(false);
+  const total = items.reduce((s,i)=>s+(i.calories||0),0);
+  return(
+    <div style={{background:C.card,border:`1px dashed ${C.warn}55`,borderRadius:14,
+      marginBottom:10,overflow:"hidden"}}>
+      <div onClick={()=>setOpen(o=>!o)} style={{display:"flex",alignItems:"center",
+        gap:10,padding:"14px 16px",cursor:"pointer",userSelect:"none"}}>
+        <div style={{width:40,height:40,borderRadius:12,background:C.warnDim,
+          display:"flex",alignItems:"center",justifyContent:"center",fontSize:20}}>🍎</div>
+        <div style={{flex:1}}>
+          <div style={{fontSize:14,fontWeight:700,color:C.warn}}>Collations</div>
+          <div style={{fontSize:11,color:C.muted}}>{items.length} collation{items.length!==1?"s":""} · <span style={{color:total>0?C.warn:C.muted}}>{total} kcal</span></div>
+        </div>
+        <div style={{fontSize:20,color:C.muted,transform:open?"rotate(180deg)":"none",transition:"transform .2s"}}>⌄</div>
+      </div>
+      {open&&(
+        <div className="fade-in" style={{padding:"0 16px 16px"}}>
+          {items.map(item=><FoodItem key={item.id} item={item} onDelete={()=>onDelete(item.id)}/>)}
+          <AddFoodForm onAdd={onAdd}/>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Water tracker ──────────────────────────────────────────────────────────
+function WaterTracker({water, onChange}){
+  const MAX=8;
+  return(
+    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:"14px 16px",marginBottom:10}}>
+      <div style={{fontSize:13,fontWeight:700,color:C.blue,marginBottom:10}}>
+        💧 Hydratation — {water}/{MAX} verres
+      </div>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+        {Array.from({length:MAX}).map((_,i)=>(
+          <button key={i} onClick={()=>onChange(i<water?i:i+1)} style={{
+            width:36,height:36,borderRadius:10,fontSize:18,cursor:"pointer",
+            background:i<water?C.blueDim:C.bg,
+            border:`1px solid ${i<water?C.blue:C.border}`,
+            transition:"all .15s"
+          }}>💧</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Steps / Google Fit ─────────────────────────────────────────────────────
+function StepsPanel({steps, onStepsChange}){
+  const [input,setInput] = useState(steps??0);
+  const [msg,setMsg] = useState("");
+  const [syncing,setSyncing] = useState(false);
+  const goal = 10000;
+  const pct = clamp((steps??0)/goal*100,0,100);
+
+  const tryGoogleFit = async()=>{
+    setSyncing(true);
+    setMsg("Google Fit nécessite OAuth2 — non disponible hors navigateur natif. Vous pouvez saisir vos pas manuellement ou utiliser Google Fit → Exporter → saisir la valeur.");
+    setSyncing(false);
+  };
+
+  const save = ()=>{
+    const n=parseInt(input);
+    if(!isNaN(n)&&n>=0){onStepsChange(n);setMsg("✓ Enregistré");}
+    setTimeout(()=>setMsg(""),2000);
+  };
+
+  return(
+    <div className="fade-in">
+      <div style={{background:C.card,border:`1px solid ${C.blueDim}`,borderRadius:14,padding:16,marginBottom:12}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
+          <div style={{width:40,height:40,borderRadius:12,background:C.blueDim,
+            display:"flex",alignItems:"center",justifyContent:"center",fontSize:20}}>🏃</div>
+          <div>
+            <div style={{fontWeight:700,color:C.blue,fontSize:14}}>Activité physique</div>
+            <div style={{fontSize:11,color:C.muted}}>Pas quotidiens</div>
+          </div>
+        </div>
+
+        {/* Big step counter */}
+        <div style={{textAlign:"center",marginBottom:16}}>
+          <div style={{fontSize:48,fontWeight:800,color:(steps??0)>=goal?C.accent:C.blue,
+            fontVariantNumeric:"tabular-nums",lineHeight:1}}>
+            {(steps??0).toLocaleString("fr-FR")}
+          </div>
+          <div style={{fontSize:13,color:C.muted}}>pas sur {goal.toLocaleString("fr-FR")} objectif</div>
+        </div>
+
+        {/* Progress */}
+        <div style={{height:10,background:C.border,borderRadius:99,marginBottom:16,overflow:"hidden"}}>
+          <div style={{
+            width:`${pct}%`,height:"100%",borderRadius:99,
+            background:`linear-gradient(90deg,${C.blue},${C.purple})`,
+            transition:"width .5s ease"
+          }}/>
+        </div>
+
+        {/* Google Fit sync button */}
+        <button onClick={tryGoogleFit} disabled={syncing} style={{
+          width:"100%",padding:"11px 0",background:C.blueDim,
+          border:`1px solid ${C.blue}55`,borderRadius:12,
+          color:C.blue,fontWeight:700,fontSize:13,cursor:"pointer",marginBottom:12,
+        }}>
+          {syncing?"Connexion…":"🔗 Synchroniser avec Google Fit"}
+        </button>
+
+        {/* Manual input */}
+        <div style={{fontSize:12,color:C.muted,marginBottom:6}}>Saisie manuelle :</div>
+        <div style={{display:"flex",gap:6}}>
+          <input type="number" value={input} onChange={e=>setInput(e.target.value)}
+            onKeyDown={e=>e.key==="Enter"&&save()}
+            placeholder="Nombre de pas…"
+            style={{flex:1,background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,
+              color:C.text,fontSize:14,padding:"9px 12px",outline:"none"}}/>
+          <button onClick={save} style={{
+            background:C.blue,color:"#fff",border:"none",borderRadius:10,
+            padding:"9px 18px",fontWeight:700,cursor:"pointer",fontSize:14
+          }}>OK</button>
+        </div>
+        {msg&&<div style={{fontSize:12,color:C.textDim,marginTop:8}}>{msg}</div>}
+      </div>
+
+      {/* Calories burned estimate */}
+      {(steps??0)>0&&(
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:14,marginBottom:12}}>
+          <div style={{fontSize:12,color:C.muted,marginBottom:4}}>Estimation brûlées</div>
+          <div style={{fontSize:22,fontWeight:800,color:C.accent}}>
+            ~{Math.round((steps??0)*0.04)} kcal
+          </div>
+          <div style={{fontSize:11,color:C.muted}}>≈ 0.04 kcal/pas (adulte moyen)</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Stats tab ──────────────────────────────────────────────────────────────
+function StatsTab({weekStats}){
+  const maxCal = Math.max(...weekStats.map(d=>d.calories),GOALS.calories);
+  return(
+    <div className="fade-in">
+      {/* Calories chart */}
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:16,marginBottom:12}}>
+        <div style={{fontSize:14,fontWeight:700,color:C.text,marginBottom:4}}>🔥 Calories — 7 jours</div>
+        <div style={{fontSize:11,color:C.muted,marginBottom:14}}>Objectif : {GOALS.calories} kcal/jour</div>
+        <div style={{display:"flex",alignItems:"flex-end",gap:5,height:120}}>
+          {weekStats.map(({date,calories})=>{
+            const h = Math.max(4,calories/maxCal*100);
+            const isToday = date===todayKey();
+            const over = calories>GOALS.calories;
+            return(
+              <div key={date} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center"}}>
+                <div style={{fontSize:10,color:C.muted,marginBottom:3,height:14}}>
+                  {calories>0?calories:""}
+                </div>
+                <div style={{
+                  width:"100%",height:`${h}px`,
+                  background:isToday?C.accent:over?C.warn:C.blue,
+                  borderRadius:"5px 5px 0 0",opacity:calories>0?1:0.2
+                }}/>
+                <div style={{fontSize:10,marginTop:4,color:isToday?C.accent:C.textDim}}>
+                  {isToday?"Auj.":new Date(date+"T12:00").toLocaleDateString("fr-FR",{weekday:"short"}).slice(0,3)}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{display:"flex",gap:12,marginTop:10,fontSize:11,color:C.muted}}>
+          <span><span style={{color:C.accent}}>■</span> Aujourd'hui</span>
+          <span><span style={{color:C.blue}}>■</span> Normal</span>
+          <span><span style={{color:C.warn}}>■</span> Dépassé</span>
+        </div>
+      </div>
+
+      {/* Steps chart */}
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:16,marginBottom:12}}>
+        <div style={{fontSize:14,fontWeight:700,color:C.text,marginBottom:14}}>👟 Pas — 7 jours</div>
+        <div style={{display:"flex",alignItems:"flex-end",gap:5,height:80}}>
+          {weekStats.map(({date,steps})=>{
+            const h = Math.max(3,clamp(steps/12000,0,1)*72);
+            return(
+              <div key={date} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center"}}>
+                <div style={{
+                  width:"100%",height:`${h}px`,
+                  background:steps>=10000?C.accent:`linear-gradient(180deg,${C.blue},${C.purple})`,
+                  borderRadius:"4px 4px 0 0",opacity:steps>0?1:0.15
+                }}/>
+                <div style={{fontSize:10,marginTop:3,color:C.textDim}}>
+                  {date===todayKey()?"Auj.":new Date(date+"T12:00").toLocaleDateString("fr-FR",{weekday:"short"}).slice(0,3)}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Averages */}
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:16}}>
+        <div style={{fontSize:14,fontWeight:700,color:C.text,marginBottom:12}}>📈 Moyennes hebdo</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          {(()=>{
+            const actCal = weekStats.filter(d=>d.calories>0);
+            const actStp = weekStats.filter(d=>d.steps>0);
+            const avgCal = actCal.length?Math.round(actCal.reduce((s,d)=>s+d.calories,0)/actCal.length):0;
+            const avgStp = actStp.length?Math.round(actStp.reduce((s,d)=>s+d.steps,0)/actStp.length):0;
+            const avgWater = weekStats.filter(d=>d.water>0);
+            const avgW = avgWater.length?Math.round(avgWater.reduce((s,d)=>s+d.water,0)/avgWater.length):0;
+            return[
+              ["🔥","Calories moy.",avgCal>0?avgCal+" kcal":"—",avgCal>0&&avgCal<=GOALS.calories?C.accent:C.warn],
+              ["👟","Pas moy.",avgStp>0?avgStp.toLocaleString("fr-FR"):"—",avgStp>=10000?C.accent:C.blue],
+              ["💧","Verres moy.",avgW>0?avgW+"/8":"—",avgW>=6?C.accent:C.blue],
+              ["📅","Jours trackés",actCal.length+"/7",actCal.length>=5?C.accent:C.warn],
+            ].map(([icon,label,val,color])=>(
+              <div key={label} style={{background:C.surface,borderRadius:12,padding:"12px 14px"}}>
+                <div style={{fontSize:18,marginBottom:4}}>{icon}</div>
+                <div style={{fontSize:10,color:C.muted,marginBottom:2}}>{label}</div>
+                <div style={{fontSize:18,fontWeight:800,color}}>{val}</div>
+              </div>
+            ));
+          })()}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ───────────────────────────────────────────────────────────────
+function App(){
+  // Build 14-day list (today + 13 past days)
+  const dayKeys = Array.from({length:14},(_,i)=>{
+    const d=new Date(); d.setDate(d.getDate()-i);
+    return d.toISOString().slice(0,10);
+  }).reverse();
+
+  const [selectedDate, setSelectedDate] = useState(todayKey());
+  const [allDays, setAllDays] = usePersist("nt_days_v3",()=>({}));
+  const [tab, setTab] = useState("journal");
+  const [toast, setToast] = useState(null);
+
+  const dayData = allDays[selectedDate] ?? defaultDay();
+  const isToday = selectedDate===todayKey();
+
+  const updateDay = useCallback((fn)=>{
+    setAllDays(prev=>{
+      const cur = prev[selectedDate]??defaultDay();
+      return {...prev,[selectedDate]:fn(cur)};
+    });
+  },[selectedDate]);
+
+  // ── Food handlers ──
+  const addFood = (slot,item)=>{
+    updateDay(day=>{
+      const list = slot==="snacks"?[...(day.snacks??[])]:
+                   [...(day.meals[slot]??[])];
+      if(item._replace){
+        const i=list.findIndex(x=>x.id===item._replace);
+        const copy={...item}; delete copy._replace;
+        if(i!==-1) list[i]=copy; else list.push(copy);
+      } else list.push(item);
+      if(slot==="snacks") return{...day,snacks:list};
+      return{...day,meals:{...day.meals,[slot]:list}};
+    });
+  };
+
+  const delFood = (slot,id)=>{
+    updateDay(day=>{
+      if(slot==="snacks") return{...day,snacks:day.snacks.filter(x=>x.id!==id)};
+      return{...day,meals:{...day.meals,[slot]:day.meals[slot].filter(x=>x.id!==id)}};
+    });
+  };
+
+  // ── Totals ──
+  const allItems = [
+    ...Object.values(dayData.meals).flat(),
+    ...(dayData.snacks??[]),
+  ];
+  const totals = allItems.reduce((a,i)=>({
+    calories: a.calories+(i.calories||0),
+    proteines:a.proteines+(i.proteines||0),
+    glucides: a.glucides+(i.glucides||0),
+    lipides:  a.lipides+(i.lipides||0),
+  }),{calories:0,proteines:0,glucides:0,lipides:0});
+
+  // ── Week stats ──
+  const weekStats = dayKeys.slice(-7).map(d=>{
+    const dd=allDays[d]??defaultDay();
+    const items=[...Object.values(dd.meals).flat(),...(dd.snacks??[])];
+    return{
+      date:d,
+      calories:items.reduce((s,i)=>s+(i.calories||0),0),
+      steps:dd.steps??0,
+      water:dd.water??0,
+    };
+  });
+
+  return(
+    <div style={{minHeight:"100vh",background:C.bg,display:"flex",flexDirection:"column"}}>
+
+      {/* ── Header ── */}
+      <div className="safe-top" style={{background:C.surface,borderBottom:`1px solid ${C.border}`,
+        position:"sticky",top:0,zIndex:20,paddingBottom:0}}>
+        <div style={{maxWidth:520,margin:"0 auto",padding:"12px 16px 0"}}>
+
+          {/* Title row */}
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+            <div>
+              <div style={{fontSize:20,fontWeight:800,letterSpacing:-0.5,color:C.accent}}>🥗 NutriTrack</div>
+              <div style={{fontSize:11,color:C.muted}}>
+                {isToday?"Aujourd'hui, ":""}{fmtDate(selectedDate)}
+                {!isToday&&<span style={{color:C.warn,marginLeft:6}}>✏️ Édition passé</span>}
+              </div>
+            </div>
+            <CalRing consumed={totals.calories} goal={GOALS.calories}/>
+          </div>
+
+          {/* Day scroller */}
+          <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:12,
+            scrollbarWidth:"none",WebkitOverflowScrolling:"touch"}}>
+            {dayKeys.slice().reverse().map(d=>{
+              const sel=d===selectedDate;
+              const today=d===todayKey();
+              return(
+                <button key={d} onClick={()=>setSelectedDate(d)} style={{
+                  flex:"0 0 auto",padding:"6px 12px",borderRadius:20,
+                  background:sel?C.accent:C.card,
+                  border:`1px solid ${sel?C.accent:C.border}`,
+                  color:sel?"#0f1117":today?C.accent:C.textDim,
+                  fontWeight:sel||today?700:400,fontSize:12,cursor:"pointer",whiteSpace:"nowrap"
+                }}>
+                  {today?"Aujourd'hui":fmtDate(d)}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Content ── */}
+      <div style={{flex:1,overflowY:"auto",WebkitOverflowScrolling:"touch"}}>
+        <div className="safe-bottom" style={{maxWidth:520,margin:"0 auto",padding:"16px 16px 0"}}>
+
+          {/* Tabs */}
+          <div style={{display:"flex",gap:3,background:C.surface,borderRadius:14,
+            padding:4,marginBottom:18}}>
+            {[["journal","📋 Journal"],["stats","📊 Stats"],["steps","🏃 Activité"]].map(([id,label])=>(
+              <button key={id} onClick={()=>setTab(id)} style={{
+                flex:1,padding:"9px 0",borderRadius:11,border:"none",cursor:"pointer",
+                fontSize:12,fontWeight:700,
+                background:tab===id?C.card:"none",
+                color:tab===id?C.text:C.muted,
+                boxShadow:tab===id?"0 1px 4px #0004":"none",
+              }}>{label}</button>
+            ))}
+          </div>
+
+          {/* ── JOURNAL ── */}
+          {tab==="journal"&&<div className="fade-in">
+
+            {/* Macro summary */}
+            <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,
+              padding:16,marginBottom:12}}>
+              <div style={{fontSize:13,fontWeight:700,color:C.textDim,marginBottom:12}}>Macronutriments du jour</div>
+              <MacroBar label="Protéines" value={totals.proteines} max={GOALS.proteines} color={C.blue}/>
+              <MacroBar label="Glucides"  value={totals.glucides}  max={GOALS.glucides}  color={C.accent}/>
+              <MacroBar label="Lipides"   value={totals.lipides}   max={GOALS.lipides}   color={C.warn}/>
+              {(dayData.steps??0)>0&&(
+                <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${C.border}`}}>
+                  <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:C.textDim}}>
+                    <span>👟 Pas</span>
+                    <span style={{color:(dayData.steps??0)>=10000?C.accent:C.blue}}>
+                      {(dayData.steps??0).toLocaleString("fr-FR")} / 10 000
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* 3 fixed meals */}
+            {FIXED_MEALS.map(m=>(
+              <MealCard key={m.id} meal={m}
+                items={dayData.meals[m.id]??[]}
+                onAdd={item=>addFood(m.id,item)}
+                onDelete={id=>delFood(m.id,id)}
+                defaultOpen={m.id==="breakfast"&&isToday}/>
+            ))}
+
+            {/* Snacks */}
+            <SnackCard
+              items={dayData.snacks??[]}
+              onAdd={item=>addFood("snacks",item)}
+              onDelete={id=>delFood("snacks",id)}/>
+
+            {/* Water */}
+            <WaterTracker water={dayData.water??0}
+              onChange={v=>updateDay(d=>({...d,water:v}))}/>
+
+            {/* Notes */}
+            <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:14,marginBottom:12}}>
+              <div style={{fontSize:13,fontWeight:700,color:C.textDim,marginBottom:8}}>📝 Notes</div>
+              <textarea value={dayData.notes??""} rows={3}
+                onChange={e=>updateDay(d=>({...d,notes:e.target.value}))}
+                placeholder="Ressenti, énergie, digestion…"
+                style={{width:"100%",background:C.surface,border:`1px solid ${C.border}`,
+                  borderRadius:10,color:C.text,fontSize:13,padding:"9px 12px",
+                  outline:"none",boxSizing:"border-box"}}/>
+            </div>
+
+          </div>}
+
+          {/* ── STATS ── */}
+          {tab==="stats"&&<StatsTab weekStats={weekStats}/>}
+
+          {/* ── ACTIVITY ── */}
+          {tab==="steps"&&<StepsPanel
+            steps={dayData.steps}
+            onStepsChange={v=>updateDay(d=>({...d,steps:v}))}/>}
+
+        </div>
+      </div>
+
+      {/* ── Bottom nav (native-app feel) ── */}
+      <div style={{
+        position:"fixed",bottom:0,left:0,right:0,zIndex:30,
+        background:C.surface+"f0",backdropFilter:"blur(20px)",
+        borderTop:`1px solid ${C.border}`,
+        paddingBottom:"env(safe-area-inset-bottom,0px)",
+      }}>
+        <div style={{maxWidth:520,margin:"0 auto",display:"flex"}}>
+          {[
+            ["journal","📋","Journal"],
+            ["stats","📊","Stats"],
+            ["steps","🏃","Activité"],
+          ].map(([id,icon,label])=>(
+            <button key={id} onClick={()=>setTab(id)} style={{
+              flex:1,padding:"10px 0 8px",border:"none",background:"none",cursor:"pointer",
+              display:"flex",flexDirection:"column",alignItems:"center",gap:2,
+            }}>
+              <span style={{fontSize:22,filter:tab===id?"none":"grayscale(1)",opacity:tab===id?1:0.4}}>{icon}</span>
+              <span style={{fontSize:10,color:tab===id?C.accent:C.muted,fontWeight:tab===id?700:400}}>{label}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {toast&&<Toast msg={toast} onDone={()=>setToast(null)}/>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
